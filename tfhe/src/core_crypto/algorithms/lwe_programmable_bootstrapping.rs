@@ -5,7 +5,9 @@ use crate::core_crypto::commons::computation_buffers::ComputationBuffers;
 use crate::core_crypto::commons::parameters::*;
 use crate::core_crypto::commons::traits::*;
 use crate::core_crypto::entities::*;
-use crate::core_crypto::fft_impl::crypto::bootstrap::{bootstrap_scratch, FourierLweBootstrapKey};
+use crate::core_crypto::fft_impl::crypto::bootstrap::{
+    bootstrap_scratch, mt_bootstrap_scratch, FourierLweBootstrapKey,
+};
 use crate::core_crypto::fft_impl::crypto::ggsw::{
     add_external_product_assign as impl_add_external_product_assign,
     add_external_product_assign_scratch as impl_add_external_product_assign_scratch, cmux,
@@ -1015,4 +1017,92 @@ pub fn programmable_bootstrap_lwe_ciphertext_mem_optimized_requirement<Scalar>(
     fft: FftView<'_>,
 ) -> Result<StackReq, SizeOverflow> {
     bootstrap_scratch::<Scalar>(glwe_size, polynomial_size, fft)
+}
+
+pub fn mt_programmable_bootstrap_lwe_ciphertext<Scalar, InputCont, OutputCont, AccCont, KeyCont>(
+    input: &LweCiphertext<InputCont>,
+    output: &mut LweCiphertext<OutputCont>,
+    accumulator: &GlweCiphertext<AccCont>,
+    fourier_bsk: &FourierLweBootstrapKey<KeyCont>,
+) where
+    // CastInto required for PBS modulus switch which returns a usize
+    Scalar: UnsignedTorus + CastInto<usize> + Send + Sync,
+    InputCont: Container<Element = Scalar>,
+    OutputCont: ContainerMut<Element = Scalar>,
+    AccCont: Container<Element = Scalar>,
+    KeyCont: Container<Element = c64>,
+{
+    let mut buffers = ComputationBuffers::new();
+
+    let fft = Fft::new(fourier_bsk.polynomial_size());
+    let fft = fft.as_view();
+
+    let num_groups = std::thread::available_parallelism().unwrap().get();
+    let group_size = (input.lwe_size().to_lwe_dimension().0 + num_groups - 1) / num_groups;
+    buffers.resize(
+        mt_programmable_bootstrap_lwe_ciphertext_mem_optimized_requirement::<Scalar>(
+            fourier_bsk.glwe_size(),
+            fourier_bsk.polynomial_size(),
+            fft,
+            num_groups,
+        )
+        .unwrap()
+        .unaligned_bytes_required(),
+    );
+
+    let stack = buffers.stack();
+
+    mt_programmable_bootstrap_lwe_ciphertext_mem_optimized(
+        input,
+        output,
+        accumulator,
+        fourier_bsk,
+        fft,
+        stack,
+        num_groups,
+        group_size,
+    )
+}
+
+pub fn mt_programmable_bootstrap_lwe_ciphertext_mem_optimized<
+    Scalar,
+    InputCont,
+    OutputCont,
+    AccCont,
+    KeyCont,
+>(
+    input: &LweCiphertext<InputCont>,
+    output: &mut LweCiphertext<OutputCont>,
+    accumulator: &GlweCiphertext<AccCont>,
+    fourier_bsk: &FourierLweBootstrapKey<KeyCont>,
+    fft: FftView<'_>,
+    stack: DynStack<'_>,
+    num_groups: usize,
+    group_size: usize,
+) where
+    // CastInto required for PBS modulus switch which returns a usize
+    Scalar: UnsignedTorus + CastInto<usize> + Send + Sync,
+    InputCont: Container<Element = Scalar>,
+    OutputCont: ContainerMut<Element = Scalar>,
+    AccCont: Container<Element = Scalar>,
+    KeyCont: Container<Element = c64>,
+{
+    fourier_bsk.as_view().mt_bootstrap(
+        output,
+        input.as_ref(),
+        accumulator.as_view(),
+        fft,
+        stack,
+        num_groups,
+        group_size,
+    );
+}
+
+pub fn mt_programmable_bootstrap_lwe_ciphertext_mem_optimized_requirement<Scalar>(
+    glwe_size: GlweSize,
+    polynomial_size: PolynomialSize,
+    fft: FftView<'_>,
+    num_groups: usize,
+) -> Result<StackReq, SizeOverflow> {
+    mt_bootstrap_scratch::<Scalar>(glwe_size, polynomial_size, fft, num_groups)
 }

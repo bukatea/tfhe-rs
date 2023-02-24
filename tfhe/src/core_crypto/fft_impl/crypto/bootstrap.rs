@@ -1,3 +1,5 @@
+use std::mem::MaybeUninit;
+
 use super::super::math::fft::{FftView, FourierPolynomialList};
 use super::ggsw::{cmux, *};
 use crate::core_crypto::algorithms::extract_lwe_sample_from_glwe_ciphertext;
@@ -9,13 +11,16 @@ use crate::core_crypto::commons::parameters::{
     ModulusSwitchOffset, MonomialDegree, PolynomialSize,
 };
 use crate::core_crypto::commons::traits::{
-    Container, ContiguousEntityContainer, ContiguousEntityContainerMut, IntoContainerOwned, Split,
+    Container, ContiguousEntityContainer, ContiguousEntityContainerMut, IntoContainerOwned,
+    ParSplit, Split,
 };
 use crate::core_crypto::commons::utils::izip;
 use crate::core_crypto::entities::*;
+use crate::core_crypto::prelude::{lwe_ciphertext_add, lwe_ciphertext_add_assign, ContainerMut};
 use aligned_vec::{avec, ABox, CACHELINE_ALIGN};
 use concrete_fft::c64;
-use dyn_stack::{DynStack, ReborrowMut, SizeOverflow, StackReq};
+use dyn_stack::{DynArray, DynStack, ReborrowMut, SizeOverflow, StackReq};
+use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(bound(deserialize = "C: IntoContainerOwned"))]
@@ -74,6 +79,37 @@ impl<C: Container<Element = c64>> FourierLweBootstrapKey<C> {
                     self.fourier.polynomial_size,
                     self.decomposition_base_log,
                     self.decomposition_level_count,
+                )
+            })
+    }
+
+    /// Return a parallel iterator over the GGSW ciphertexts composing the key.
+    pub fn into_par_ggsw_group_iter(
+        self,
+        group_size: usize,
+    ) -> impl IndexedParallelIterator<Item = (usize, Vec<FourierGgswCiphertext<C>>)>
+    where
+        C: ParSplit + Send,
+    {
+        self.fourier
+            .data
+            .par_split_into(self.input_lwe_dimension.0 * group_size)
+            .enumerate()
+            .map(move |(index, big_slice)| {
+                (
+                    index * group_size,
+                    big_slice
+                        .par_split_into(self.input_lwe_dimension.0)
+                        .map(move |slice| {
+                            FourierGgswCiphertext::from_container(
+                                slice,
+                                self.glwe_size,
+                                self.fourier.polynomial_size,
+                                self.decomposition_base_log,
+                                self.decomposition_level_count,
+                            )
+                        })
+                        .collect(),
                 )
             })
     }
@@ -211,6 +247,32 @@ pub fn bootstrap_scratch<Scalar>(
     )
 }
 
+/// Split stack into multiple parts.
+fn split_stack(mut stack: DynStack<'_>, mut n: usize) -> Vec<DynArray<'_, MaybeUninit<u8>>> {
+    n = n.min(stack.len_bytes());
+    let mut buffer_segments = Vec::with_capacity(n);
+    let substack_size = stack.len_bytes() / n;
+    for _ in 0..n {
+        let (buffer, substack) = stack.make_aligned_uninit(substack_size, CACHELINE_ALIGN);
+        stack = substack;
+        buffer_segments.push(buffer);
+    }
+    buffer_segments
+}
+
+/// Return the required memory for [`FourierLweBootstrapKeyView::mt_bootstrap`]
+pub fn mt_bootstrap_scratch<Scalar>(
+    glwe_size: GlweSize,
+    polynomial_size: PolynomialSize,
+    fft: FftView<'_>,
+    num_groups: usize,
+) -> Result<StackReq, SizeOverflow> {
+    StackReq::try_all_of(
+        std::iter::repeat(bootstrap_scratch::<Scalar>(glwe_size, polynomial_size, fft).unwrap())
+            .take(num_groups),
+    )
+}
+
 impl<'a> FourierLweBootstrapKeyView<'a> {
     // CastInto required for PBS modulus switch which returns a usize
     pub fn blind_rotate_assign<Scalar: UnsignedTorus + CastInto<usize>>(
@@ -295,6 +357,137 @@ impl<'a> FourierLweBootstrapKeyView<'a> {
             &mut LweCiphertextMutView::from_container(&mut *lwe_out),
             MonomialDegree(0),
         );
+    }
+
+    // CastInto required for PBS modulus switch which returns a usize
+    fn partial_blind_rotate_assign<Scalar: UnsignedTorus + CastInto<usize>, I>(
+        lut: GlweCiphertextMutView<'_, Scalar>,
+        partial_mask: &[Scalar],
+        partial_bootstrap_iter: I,
+        fft: FftView<'_>,
+        mut stack: DynStack<'_>,
+    ) where
+        I: Iterator<Item = FourierGgswCiphertextView<'a>>,
+    {
+        let lut_poly_size = lut.polynomial_size();
+
+        // We initialize the ct_0 used for the successive cmuxes
+        let mut ct0 = lut;
+
+        for (lwe_mask_element, bootstrap_key_ggsw) in
+            izip!(partial_mask.iter(), partial_bootstrap_iter)
+        {
+            if *lwe_mask_element != Scalar::ZERO {
+                let stack = stack.rb_mut();
+                // We copy ct_0 to ct_1
+                let (mut ct1, stack) =
+                    stack.collect_aligned(CACHELINE_ALIGN, ct0.as_ref().iter().copied());
+                let mut ct1 =
+                    GlweCiphertextMutView::from_container(&mut *ct1, ct0.polynomial_size());
+
+                // We rotate ct_1 by performing ct_1 <- ct_1 * X^{a_hat}
+                for mut poly in ct1.as_mut_polynomial_list().iter_mut() {
+                    polynomial_wrapping_monic_monomial_mul_assign(
+                        &mut poly,
+                        MonomialDegree(pbs_modulus_switch(
+                            *lwe_mask_element,
+                            lut_poly_size,
+                            ModulusSwitchOffset(0),
+                            LutCountLog(0),
+                        )),
+                    );
+                }
+
+                // ct1 is re-created each loop it can be moved, ct0 is already a view, but
+                // as_mut_view is required to keep borrow rules consistent
+                cmux(ct0.as_mut_view(), ct1, bootstrap_key_ggsw, fft, stack);
+            }
+        }
+    }
+
+    pub fn mt_bootstrap<Scalar, OutputCont>(
+        self,
+        lwe_out: &mut LweCiphertext<OutputCont>,
+        lwe_in: &[Scalar],
+        accumulator: GlweCiphertextView<'_, Scalar>,
+        fft: FftView<'_>,
+        stack: DynStack<'_>,
+        num_groups: usize,
+        group_size: usize,
+    ) where
+        // CastInto required for PBS modulus switch which returns a usize
+        Scalar: UnsignedTorus + CastInto<usize> + Send + Sync,
+        OutputCont: ContainerMut<Element = Scalar>,
+    {
+        let (lwe_body, lwe_mask) = lwe_in.split_last().unwrap();
+
+        if !stack.can_hold(
+            mt_bootstrap_scratch::<Scalar>(
+                accumulator.glwe_size(),
+                accumulator.polynomial_size(),
+                fft,
+                num_groups,
+            )
+            .unwrap(),
+        ) {
+            panic!("stack too small");
+        }
+
+        // TODO: might want to directly work with slices here
+        let accumulate_extract = |start, partial_bootstrap_iter, mut stack: DynStack<'_>| {
+            let stack = stack.rb_mut();
+            let (mut local_accumulator_data, stack) =
+                stack.collect_aligned(CACHELINE_ALIGN, accumulator.as_ref().iter().copied());
+            let mut local_accumulator = GlweCiphertextMutView::from_container(
+                &mut *local_accumulator_data,
+                accumulator.polynomial_size(),
+            );
+
+            let mut lwe_out =
+                LweCiphertext::new(Scalar::ZERO, self.output_lwe_dimension().to_lwe_size());
+            let end = self.input_lwe_dimension().0.min(start + group_size);
+            let partial_mask = &lwe_mask[start..end];
+            Self::partial_blind_rotate_assign(
+                local_accumulator.as_mut_view(),
+                partial_mask,
+                partial_bootstrap_iter,
+                fft,
+                stack,
+            );
+            extract_lwe_sample_from_glwe_ciphertext(
+                &local_accumulator,
+                &mut lwe_out,
+                MonomialDegree(0),
+            );
+            lwe_out
+        };
+
+        let mut buffer_segments = split_stack(stack, num_groups);
+
+        let combined_sample = self
+            .into_par_ggsw_group_iter(group_size)
+            .zip_eq(buffer_segments.par_iter_mut())
+            .map(|((index, partial_bootstrap_keys), buffer)| {
+                accumulate_extract(
+                    index,
+                    partial_bootstrap_keys.into_iter(),
+                    DynStack::new(buffer),
+                )
+            })
+            .reduce_with(|sample_1, sample_2| {
+                let mut combined_sample =
+                    LweCiphertext::new(Scalar::ZERO, self.output_lwe_dimension().to_lwe_size());
+                lwe_ciphertext_add(&mut combined_sample, &sample_1, &sample_2);
+                combined_sample
+            })
+            .unwrap();
+        // TODO: might need to mess with precision here
+        extract_lwe_sample_from_glwe_ciphertext(
+            &accumulator,
+            lwe_out,
+            MonomialDegree(<Scalar as CastInto<usize>>::cast_into(*lwe_body)),
+        );
+        lwe_ciphertext_add_assign(lwe_out, &combined_sample);
     }
 }
 

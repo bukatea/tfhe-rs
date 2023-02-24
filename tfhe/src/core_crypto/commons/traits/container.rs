@@ -1,5 +1,7 @@
 //! Module with traits pertaining to container manipulation.
 
+use rayon::prelude::*;
+
 /// A trait to manipulate various immutable container types transparently.
 pub trait Container: AsRef<[Self::Element]> {
     type Element;
@@ -114,6 +116,62 @@ impl<'a, T> Split for &'a mut [T] {
     }
     #[inline]
     fn split_at(self, mid: usize) -> (Self, Self) {
+        self.split_at_mut(mid)
+    }
+}
+
+pub trait ParSplit: Sized {
+    type Chunks: IndexedParallelIterator<Item = Self>;
+
+    fn into_par_chunks(self, chunk_size: usize) -> Self::Chunks;
+    fn par_split_into(self, chunk_count: usize) -> Self::Chunks;
+    fn par_split_at(self, mid: usize) -> (Self, Self);
+}
+
+impl<'a, T: Sync> ParSplit for &'a [T] {
+    type Chunks = rayon::slice::Chunks<'a, T>;
+
+    #[inline]
+    fn into_par_chunks(self, chunk_size: usize) -> Self::Chunks {
+        debug_assert_eq!(self.len() % chunk_size, 0);
+        self.par_chunks(chunk_size)
+    }
+    #[inline]
+    fn par_split_into(self, chunk_count: usize) -> Self::Chunks {
+        if chunk_count == 0 {
+            debug_assert_eq!(self.len(), 0);
+            self.par_chunks(1)
+        } else {
+            debug_assert_eq!(self.len() % chunk_count, 0);
+            self.par_chunks(self.len() / chunk_count)
+        }
+    }
+    #[inline]
+    fn par_split_at(self, mid: usize) -> (Self, Self) {
+        self.split_at(mid)
+    }
+}
+
+impl<'a, T: Send> ParSplit for &'a mut [T] {
+    type Chunks = rayon::slice::ChunksMut<'a, T>;
+
+    #[inline]
+    fn into_par_chunks(self, chunk_size: usize) -> Self::Chunks {
+        debug_assert_eq!(self.len() % chunk_size, 0);
+        self.par_chunks_mut(chunk_size)
+    }
+    #[inline]
+    fn par_split_into(self, chunk_count: usize) -> Self::Chunks {
+        if chunk_count == 0 {
+            debug_assert_eq!(self.len(), 0);
+            self.par_chunks_mut(1)
+        } else {
+            debug_assert_eq!(self.len() % chunk_count, 0);
+            self.par_chunks_mut(self.len() / chunk_count)
+        }
+    }
+    #[inline]
+    fn par_split_at(self, mid: usize) -> (Self, Self) {
         self.split_at_mut(mid)
     }
 }
