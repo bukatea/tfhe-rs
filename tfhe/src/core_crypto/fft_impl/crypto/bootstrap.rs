@@ -19,6 +19,7 @@ use crate::core_crypto::entities::*;
 use crate::core_crypto::prelude::{lwe_ciphertext_add, lwe_ciphertext_add_assign, ContainerMut};
 use aligned_vec::{avec, ABox, CACHELINE_ALIGN};
 use concrete_fft::c64;
+use crossbeam::channel::bounded;
 use dyn_stack::{DynArray, DynStack, ReborrowMut, SizeOverflow, StackReq};
 use rayon::prelude::*;
 
@@ -87,29 +88,38 @@ impl<C: Container<Element = c64>> FourierLweBootstrapKey<C> {
     pub fn into_par_ggsw_group_iter(
         self,
         group_size: usize,
-    ) -> impl IndexedParallelIterator<Item = (usize, Vec<FourierGgswCiphertext<C>>)>
+    ) -> impl IndexedParallelIterator<
+        Item = (
+            usize,
+            impl IndexedParallelIterator<Item = (usize, FourierGgswCiphertext<C>)>,
+        ),
+    >
     where
         C: ParSplit + Send,
     {
+        let ggsw_size = self.fourier.data.container_len() / self.input_lwe_dimension.0;
         self.fourier
             .data
-            .par_split_into(self.input_lwe_dimension.0 * group_size)
+            .into_par_chunks(ggsw_size * group_size)
             .enumerate()
             .map(move |(index, big_slice)| {
                 (
                     index * group_size,
                     big_slice
-                        .par_split_into(self.input_lwe_dimension.0)
-                        .map(move |slice| {
-                            FourierGgswCiphertext::from_container(
-                                slice,
-                                self.glwe_size,
-                                self.fourier.polynomial_size,
-                                self.decomposition_base_log,
-                                self.decomposition_level_count,
+                        .into_par_chunks(ggsw_size)
+                        .enumerate()
+                        .map(move |(index, slice)| {
+                            (
+                                index,
+                                FourierGgswCiphertext::from_container(
+                                    slice,
+                                    self.glwe_size,
+                                    self.fourier.polynomial_size,
+                                    self.decomposition_base_log,
+                                    self.decomposition_level_count,
+                                ),
                             )
-                        })
-                        .collect(),
+                        }),
                 )
             })
     }
@@ -253,7 +263,7 @@ fn split_stack(mut stack: DynStack<'_>, mut n: usize) -> Vec<DynArray<'_, MaybeU
     let mut buffer_segments = Vec::with_capacity(n);
     let substack_size = stack.len_bytes() / n;
     for _ in 0..n {
-        let (buffer, substack) = stack.make_aligned_uninit(substack_size, CACHELINE_ALIGN);
+        let (buffer, substack) = stack.make_uninit(substack_size);
         stack = substack;
         buffer_segments.push(buffer);
     }
@@ -360,49 +370,65 @@ impl<'a> FourierLweBootstrapKeyView<'a> {
     }
 
     // CastInto required for PBS modulus switch which returns a usize
-    fn partial_blind_rotate_assign<Scalar: UnsignedTorus + CastInto<usize>, I>(
+    fn partial_blind_rotate_assign<Scalar: UnsignedTorus + CastInto<usize> + Send + Sync, C>(
         lut: GlweCiphertextMutView<'_, Scalar>,
         partial_mask: &[Scalar],
-        partial_bootstrap_iter: I,
+        partial_bootstrap_iter: impl ParallelIterator<Item = (usize, FourierGgswCiphertext<C>)>,
         fft: FftView<'_>,
         mut stack: DynStack<'_>,
     ) where
-        I: Iterator<Item = FourierGgswCiphertextView<'a>>,
+        C: Container<Element = c64> + Send + Sync,
     {
         let lut_poly_size = lut.polynomial_size();
 
         // We initialize the ct_0 used for the successive cmuxes
         let mut ct0 = lut;
 
-        for (lwe_mask_element, bootstrap_key_ggsw) in
-            izip!(partial_mask.iter(), partial_bootstrap_iter)
-        {
-            if *lwe_mask_element != Scalar::ZERO {
-                let stack = stack.rb_mut();
-                // We copy ct_0 to ct_1
-                let (mut ct1, stack) =
-                    stack.collect_aligned(CACHELINE_ALIGN, ct0.as_ref().iter().copied());
-                let mut ct1 =
-                    GlweCiphertextMutView::from_container(&mut *ct1, ct0.polynomial_size());
+        let (s, r) = bounded(partial_mask.len());
 
-                // We rotate ct_1 by performing ct_1 <- ct_1 * X^{a_hat}
-                for mut poly in ct1.as_mut_polynomial_list().iter_mut() {
-                    polynomial_wrapping_monic_monomial_mul_assign(
-                        &mut poly,
-                        MonomialDegree(pbs_modulus_switch(
-                            *lwe_mask_element,
-                            lut_poly_size,
-                            ModulusSwitchOffset(0),
-                            LutCountLog(0),
-                        )),
-                    );
+        rayon::join(
+            move || {
+                partial_bootstrap_iter.for_each(move |elem| {
+                    s.send(elem).unwrap();
+                })
+            },
+            || {
+                for (index, bootstrap_key_ggsw) in r.iter() {
+                    let lwe_mask_element = partial_mask[index];
+                    if lwe_mask_element != Scalar::ZERO {
+                        let stack = stack.rb_mut();
+                        // We copy ct_0 to ct_1
+                        let (mut ct1, stack) =
+                            stack.collect_aligned(CACHELINE_ALIGN, ct0.as_ref().iter().copied());
+                        let mut ct1 =
+                            GlweCiphertextMutView::from_container(&mut *ct1, ct0.polynomial_size());
+
+                        // We rotate ct_1 by performing ct_1 <- ct_1 * X^{a_hat}
+                        for mut poly in ct1.as_mut_polynomial_list().iter_mut() {
+                            polynomial_wrapping_monic_monomial_mul_assign(
+                                &mut poly,
+                                MonomialDegree(pbs_modulus_switch(
+                                    lwe_mask_element,
+                                    lut_poly_size,
+                                    ModulusSwitchOffset(0),
+                                    LutCountLog(0),
+                                )),
+                            );
+                        }
+
+                        // ct1 is re-created each loop it can be moved, ct0 is already a view, but
+                        // as_mut_view is required to keep borrow rules consistent
+                        cmux(
+                            ct0.as_mut_view(),
+                            ct1,
+                            bootstrap_key_ggsw.as_view(),
+                            fft,
+                            stack,
+                        );
+                    }
                 }
-
-                // ct1 is re-created each loop it can be moved, ct0 is already a view, but
-                // as_mut_view is required to keep borrow rules consistent
-                cmux(ct0.as_mut_view(), ct1, bootstrap_key_ggsw, fft, stack);
-            }
-        }
+            },
+        );
     }
 
     pub fn mt_bootstrap<Scalar, OutputCont>(
@@ -468,11 +494,7 @@ impl<'a> FourierLweBootstrapKeyView<'a> {
             .into_par_ggsw_group_iter(group_size)
             .zip_eq(buffer_segments.par_iter_mut())
             .map(|((index, partial_bootstrap_keys), buffer)| {
-                accumulate_extract(
-                    index,
-                    partial_bootstrap_keys.into_iter(),
-                    DynStack::new(buffer),
-                )
+                accumulate_extract(index, partial_bootstrap_keys, DynStack::new(buffer))
             })
             .reduce_with(|sample_1, sample_2| {
                 let mut combined_sample =
@@ -485,7 +507,12 @@ impl<'a> FourierLweBootstrapKeyView<'a> {
         extract_lwe_sample_from_glwe_ciphertext(
             &accumulator,
             lwe_out,
-            MonomialDegree(<Scalar as CastInto<usize>>::cast_into(*lwe_body)),
+            MonomialDegree(pbs_modulus_switch(
+                *lwe_body,
+                accumulator.polynomial_size(),
+                ModulusSwitchOffset(0),
+                LutCountLog(0),
+            )),
         );
         lwe_ciphertext_add_assign(lwe_out, &combined_sample);
     }

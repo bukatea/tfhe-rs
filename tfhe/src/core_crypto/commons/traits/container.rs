@@ -133,16 +133,13 @@ impl<'a, T: Sync> ParSplit for &'a [T] {
 
     #[inline]
     fn into_par_chunks(self, chunk_size: usize) -> Self::Chunks {
-        debug_assert_eq!(self.len() % chunk_size, 0);
         self.par_chunks(chunk_size)
     }
     #[inline]
     fn par_split_into(self, chunk_count: usize) -> Self::Chunks {
         if chunk_count == 0 {
-            debug_assert_eq!(self.len(), 0);
             self.par_chunks(1)
         } else {
-            debug_assert_eq!(self.len() % chunk_count, 0);
             self.par_chunks(self.len() / chunk_count)
         }
     }
@@ -157,16 +154,13 @@ impl<'a, T: Send> ParSplit for &'a mut [T] {
 
     #[inline]
     fn into_par_chunks(self, chunk_size: usize) -> Self::Chunks {
-        debug_assert_eq!(self.len() % chunk_size, 0);
         self.par_chunks_mut(chunk_size)
     }
     #[inline]
     fn par_split_into(self, chunk_count: usize) -> Self::Chunks {
         if chunk_count == 0 {
-            debug_assert_eq!(self.len(), 0);
             self.par_chunks_mut(1)
         } else {
-            debug_assert_eq!(self.len() % chunk_count, 0);
             self.par_chunks_mut(self.len() / chunk_count)
         }
     }
