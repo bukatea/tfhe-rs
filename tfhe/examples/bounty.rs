@@ -159,7 +159,7 @@ fn main() {
     if multithread {
         println!("Computing MTPBS...");
         let now = std::time::Instant::now();
-        mt_programmable_bootstrap_lwe_ciphertext(
+        mt_linear_programmable_bootstrap_lwe_ciphertext(
             &lwe_ciphertext_in,
             &mut pbs_multiplication_ct,
             &accumulator,

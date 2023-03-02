@@ -1019,7 +1019,13 @@ pub fn programmable_bootstrap_lwe_ciphertext_mem_optimized_requirement<Scalar>(
     bootstrap_scratch::<Scalar>(glwe_size, polynomial_size, fft)
 }
 
-pub fn mt_programmable_bootstrap_lwe_ciphertext<Scalar, InputCont, OutputCont, AccCont, KeyCont>(
+pub fn mt_linear_programmable_bootstrap_lwe_ciphertext<
+    Scalar,
+    InputCont,
+    OutputCont,
+    AccCont,
+    KeyCont,
+>(
     input: &LweCiphertext<InputCont>,
     output: &mut LweCiphertext<OutputCont>,
     accumulator: &GlweCiphertext<AccCont>,
@@ -1040,7 +1046,7 @@ pub fn mt_programmable_bootstrap_lwe_ciphertext<Scalar, InputCont, OutputCont, A
     let num_groups = std::thread::available_parallelism().unwrap().get();
     let group_size = (input.lwe_size().to_lwe_dimension().0 + num_groups - 1) / num_groups;
     buffers.resize(
-        mt_programmable_bootstrap_lwe_ciphertext_mem_optimized_requirement::<Scalar>(
+        mt_linear_programmable_bootstrap_lwe_ciphertext_mem_optimized_requirement::<Scalar>(
             fourier_bsk.glwe_size(),
             fourier_bsk.polynomial_size(),
             fft,
@@ -1052,7 +1058,7 @@ pub fn mt_programmable_bootstrap_lwe_ciphertext<Scalar, InputCont, OutputCont, A
 
     let stack = buffers.stack();
 
-    mt_programmable_bootstrap_lwe_ciphertext_mem_optimized(
+    mt_linear_programmable_bootstrap_lwe_ciphertext_mem_optimized(
         input,
         output,
         accumulator,
@@ -1064,7 +1070,7 @@ pub fn mt_programmable_bootstrap_lwe_ciphertext<Scalar, InputCont, OutputCont, A
     )
 }
 
-pub fn mt_programmable_bootstrap_lwe_ciphertext_mem_optimized<
+pub fn mt_linear_programmable_bootstrap_lwe_ciphertext_mem_optimized<
     Scalar,
     InputCont,
     OutputCont,
@@ -1098,7 +1104,7 @@ pub fn mt_programmable_bootstrap_lwe_ciphertext_mem_optimized<
     );
 }
 
-pub fn mt_programmable_bootstrap_lwe_ciphertext_mem_optimized_requirement<Scalar>(
+pub fn mt_linear_programmable_bootstrap_lwe_ciphertext_mem_optimized_requirement<Scalar>(
     glwe_size: GlweSize,
     polynomial_size: PolynomialSize,
     fft: FftView<'_>,
